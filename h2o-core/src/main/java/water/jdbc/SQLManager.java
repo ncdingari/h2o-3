@@ -31,7 +31,6 @@ public class SQLManager {
   private static final String NETEZZA_JDBC_DRIVER_CLASS = "org.netezza.Driver";
   private static final String HIVE_JDBC_DRIVER_CLASS = "org.apache.hive.jdbc.HiveDriver";
 
-  private static final String MAX_CHUNK_LOG2_SIZE = H2O.OptArgs.SYSTEM_PROP_PREFIX + "sql.max.chunk.log2.size";
   private static final String AUTO_REBALANCE_ENABLED = H2O.OptArgs.SYSTEM_PROP_PREFIX + "sql.rebalance.enabled";
   private static final String TMP_TABLE_ENABLED = H2O.OptArgs.SYSTEM_PROP_PREFIX + "sql.tmp.table.enabled";
 
@@ -62,9 +61,11 @@ public class SQLManager {
     String databaseType = connection_url.split(":", 3)[1];
     initializeDatabaseDriver(databaseType);
     final boolean needFetchClause = ORACLE_DB_TYPE.equals(databaseType) || SQL_SERVER_DB_TYPE.equals(databaseType);
+    int catcols = 0, intcols = 0, bincols = 0, realcols = 0, timecols = 0, stringcols = 0;
+    final int numCol;
     long numRow = 0;
-    final RowDesc rd;
-
+    final String[] columnNames;
+    final byte[] columnH2OTypes;
     try {
       conn = DriverManager.getConnection(connection_url, username, password);
       stmt = conn.createStatement();
@@ -91,28 +92,71 @@ public class SQLManager {
         //tables with this name are assumed to be created here temporarily and are dropped
         throw new IllegalArgumentException("The specified table cannot be named: " + SQLManager.TEMP_TABLE_NAME);
       }
-     //get H2O column names and types
-      if (needFetchClause)
-        rs = stmt.executeQuery("SELECT " + columns + " FROM " + table + " FETCH NEXT 1 ROWS ONLY");
-      else
-        rs = stmt.executeQuery("SELECT " + columns + " FROM " + table + " LIMIT 1");
-
-      rd = RowDesc.fromResultSetMetaData(rs.getMetaData());
-
-      rs.next();
-      rs.close();
-
+      //get number of rows. check for negative row count
       if (numRow <= 0) {
         rs = stmt.executeQuery("SELECT COUNT(1) FROM " + table);
         rs.next();
         numRow = rs.getLong(1);
         rs.close();
       }
+      //get H2O column names and types
+      if (needFetchClause)
+        rs = stmt.executeQuery("SELECT " + columns + " FROM " + table + " FETCH NEXT 1 ROWS ONLY");
+      else
+        rs = stmt.executeQuery("SELECT " + columns + " FROM " + table + " LIMIT 1");
+      ResultSetMetaData rsmd = rs.getMetaData();
+      numCol = rsmd.getColumnCount();
+
+      columnNames = new String[numCol];
+      columnH2OTypes = new byte[numCol];
+
+      rs.next();
+      for (int i = 0; i < numCol; i++) {
+        columnNames[i] = rsmd.getColumnName(i + 1);
+        //must iterate through sql types instead of getObject bc object could be null
+        switch (rsmd.getColumnType(i + 1)) {
+          case Types.NUMERIC:
+          case Types.REAL:
+          case Types.DOUBLE:
+          case Types.FLOAT:
+          case Types.DECIMAL:
+            columnH2OTypes[i] = Vec.T_NUM;
+            realcols += 1;
+            break;
+          case Types.INTEGER:
+          case Types.TINYINT:
+          case Types.SMALLINT:
+          case Types.BIGINT:
+            columnH2OTypes[i] = Vec.T_NUM;
+            intcols += 1;
+            break;
+          case Types.BIT:
+          case Types.BOOLEAN:
+            columnH2OTypes[i] = Vec.T_NUM;
+            bincols += 1;
+            break;
+          case Types.VARCHAR:
+          case Types.NVARCHAR:
+          case Types.CHAR:
+          case Types.NCHAR:
+          case Types.LONGVARCHAR:
+          case Types.LONGNVARCHAR:
+            columnH2OTypes[i] = Vec.T_STR;
+            stringcols += 1;
+            break;
+          case Types.DATE:
+          case Types.TIME:
+          case Types.TIMESTAMP:
+            columnH2OTypes[i] = Vec.T_TIME;
+            timecols += 1;
+            break;
+          default:
+            Log.warn("Unsupported column type: " + rsmd.getColumnTypeName(i + 1));
+            columnH2OTypes[i] = Vec.T_BAD;
+        }
+      }
 
     } catch (SQLException ex) {
-      if (table.equals(SQLManager.TEMP_TABLE_NAME))
-        dropTempTable(connection_url, username, password);
-
       throw new RuntimeException("SQLException: " + ex.getMessage() + "\nFailed to connect and read from SQL database with connection_url: " + connection_url);
     } finally {
       // release resources in a finally{} block in reverse-order of their creation
@@ -138,19 +182,21 @@ public class SQLManager {
       }
     }
 
+    double binary_ones_fraction = 0.5; //estimate
+
     //create template vectors in advance and run MR
-    final long totSize = numRow * rd.rowSize();
+    final long totSize =
+            (long)((float)(catcols+intcols)*numRow*4 //4 bytes for categoricals and integers
+                    +(float)bincols          *numRow*1*binary_ones_fraction //sparse uses a fraction of one byte (or even less)
+                    +(float)(realcols+timecols+stringcols) *numRow*8); //8 bytes for real and time (long) values
+
     final Vec _retrieval_v;
-    final int chunk_size = FileVec.calcOptimalChunkSize(totSize, rd.numCol, rd.numCol * 4,
+    final int chunk_size = FileVec.calcOptimalChunkSize(totSize, numCol, numCol * 4,
             H2O.ARGS.nthreads, H2O.getCloudSize(), false, false);
     final double rows_per_chunk = chunk_size; //why not numRow * chunk_size / totSize; it's supposed to be rows per chunk, not the byte size
     final Vec _v = makeCon(0, numRow, (int) Math.ceil(Math.log1p(rows_per_chunk)), false);
 
     if (optimize) {
-      //for single and small number of nodes (~3), retrieval is optimal on hive for maxChunkLog2Size=27 (instead of default 28)
-//      final int maxChunkLog2Size = Integer.parseInt(System.getProperty(MAX_CHUNK_LOG2_SIZE, "0"));
-//      _retrieval_v = maxChunkLog2Size > 0 ? makeCon(totSize, numRow, 1<<maxChunkLog2Size) : makeCon(totSize, numRow);
-
       // for optimal retrieval and rebalancing, use min 1 chunk per node, and max chunks = min(max(total threads), max(total connections))
       final int num_retrieval_chunks = H2O.getCloudSize() * ConnectionPoolProvider.getOptimalConnectionPerNode(H2O.getCloudSize(), H2O.ARGS.nthreads);
       _retrieval_v = num_retrieval_chunks > _v.nChunks() ? _v : makeCon(numRow, num_retrieval_chunks);
@@ -171,10 +217,10 @@ public class SQLManager {
       public void compute2() {
         final ConnectionPoolProvider provider = new ConnectionPoolProvider(connection_url, username, password, _retrieval_v.nChunks());
         final Frame fr;
-        final Key k = Key.make();
-        final Frame retrieval_fr = new SqlTableToH2OFrame(finalTable, needFetchClause, columns, rd , j, provider)
-                .doAll(rd.columnH2OTypes, _retrieval_v)
-                .outputFrame(k, rd.columnNames, rd.getDomains());
+        final Key tmpKey = Key.make();
+        final Frame retrieval_fr = new SqlTableToH2OFrame(finalTable, needFetchClause, columns, numCol, j, provider)
+                .doAll(columnH2OTypes, _retrieval_v)
+                .outputFrame(tmpKey, columnNames, null);
 
         if (autoRebalance) {
           final RebalanceDataSet rds = new RebalanceDataSet(retrieval_fr, destination_key, _v.nChunks());
@@ -189,105 +235,14 @@ public class SQLManager {
 
         DKV.put(fr);
         ParseDataset.logParseResults(fr);
+        if (finalTable.equals(SQLManager.TEMP_TABLE_NAME))
+          dropTempTable(connection_url, username, password);
         tryComplete();
-      }
-
-      @Override
-      public void onCompletion(CountedCompleter caller) {
-        if (finalTable.equals(SQLManager.TEMP_TABLE_NAME))
-          dropTempTable(connection_url, username, password);
-        super.onCompletion(caller);
-      }
-
-      @Override
-      public boolean onExceptionalCompletion(Throwable ex, CountedCompleter caller) {
-        if (finalTable.equals(SQLManager.TEMP_TABLE_NAME))
-          dropTempTable(connection_url, username, password);
-        return super.onExceptionalCompletion(ex, caller);
       }
     };
     j.start(work, _retrieval_v.nChunks());
     
     return j;
-  }
-
-  static class RowDesc extends Iced<RowDesc> {
-    private static final double BINARY_ONES_FRACTION = 0.5; //estimate
-
-    static RowDesc fromResultSetMetaData(ResultSetMetaData rsmd) throws SQLException {
-      final RowDesc rd = new RowDesc(rsmd.getColumnCount());
-
-      for (int i = 0; i < rd.numCol; i++) {
-        rd.columnNames[i] = rsmd.getColumnName(i + 1);
-        //must iterate through sql types instead of getObject bc object could be null
-        switch (rsmd.getColumnType(i + 1)) {
-          case Types.NUMERIC:
-          case Types.REAL:
-          case Types.DOUBLE:
-          case Types.FLOAT:
-          case Types.DECIMAL:
-            rd.columnH2OTypes[i] = Vec.T_NUM;
-            rd.real_c += 1;
-            break;
-          case Types.INTEGER:
-          case Types.TINYINT:
-          case Types.SMALLINT:
-          case Types.BIGINT:
-            rd.columnH2OTypes[i] = Vec.T_NUM;
-            rd.int_c += 1;
-            break;
-          case Types.BIT:
-          case Types.BOOLEAN:
-            rd.columnH2OTypes[i] = Vec.T_NUM;
-            rd.binary_c += 1;
-            break;
-          case Types.VARCHAR:
-          case Types.NVARCHAR:
-          case Types.CHAR:
-          case Types.NCHAR:
-          case Types.LONGVARCHAR:
-          case Types.LONGNVARCHAR:
-            rd.columnH2OTypes[i] = Vec.T_STR;
-            rd.string_c += 1;
-            break;
-          case Types.DATE:
-          case Types.TIME:
-          case Types.TIMESTAMP:
-            rd.columnH2OTypes[i] = Vec.T_TIME;
-            rd.time_c += 1;
-            break;
-          default:
-            Log.warn("Unsupported column type: " + rsmd.getColumnTypeName(i + 1));
-            rd.columnH2OTypes[i] = Vec.T_BAD;
-        }
-      }
-
-      return rd;
-    }
-
-    final int numCol;
-    final String[] columnNames;
-    final byte[] columnH2OTypes;
-
-    int categorical_c = 0, int_c = 0, binary_c = 0, real_c = 0, time_c = 0, string_c = 0;
-
-    private RowDesc(int numCol) {
-        this.numCol = numCol;
-        this.columnNames = new String[numCol];
-        this.columnH2OTypes = new byte[numCol];
-    }
-
-    int rowSize() {
-      return (
-              (this.categorical_c + this.int_c) * 4               //4 bytes for categoricals and integer
-              + (int)(this.binary_c * 1 * BINARY_ONES_FRACTION)   //sparse uses a fraction of one byte (or even less)
-              + (this.real_c + this.time_c + this.string_c) * 8   //8 bytes for real and time (long) values
-      );
-    }
-
-    String[][] getDomains() {
-      return null;
-    }
   }
 
   static class ConnectionPoolProvider extends Iced<ConnectionPoolProvider> {
@@ -379,7 +334,7 @@ public class SQLManager {
      * @param maxTotalConnections Maximal number of total connections to be opened by the whole cluster
      * @return Number of connections to open per node, within given minmal and maximal range
      */
-    private static int calculateLocalConnectionCount(final int maxTotalConnections, final int cloudSize,
+    private static final int calculateLocalConnectionCount(final int maxTotalConnections, final int cloudSize,
                                                            final short nThreads, final int nChunks) {
       int conPerNode = (int) Math.min(Math.ceil((double) nChunks / cloudSize), nThreads);
       conPerNode = Math.min(conPerNode, maxTotalConnections / cloudSize);
@@ -432,19 +387,19 @@ public class SQLManager {
 
   static class SqlTableToH2OFrame extends MRTask<SqlTableToH2OFrame> {
     final String _table, _columns;
+    final int _numCol;
     final boolean _needFetchClause;
-    final RowDesc _rowDesc;
     final Job _job;
     final ConnectionPoolProvider _poolProvider;
 
     transient ArrayBlockingQueue<Connection> sqlConn;
 
-    public SqlTableToH2OFrame(final String table, final boolean needFetchClause, final String columns, final RowDesc rowDesc,
+    public SqlTableToH2OFrame(final String table, final boolean needFetchClause, final String columns, final int numCol,
                               final Job job, final ConnectionPoolProvider poolProvider) {
       _table = table;
       _needFetchClause = needFetchClause;
       _columns = columns;
-      _rowDesc = rowDesc;
+      _numCol = numCol;
       _job = job;
       _poolProvider = poolProvider;
     }
@@ -474,7 +429,7 @@ public class SQLManager {
         stmt.setFetchSize(c0._len);
         rs = stmt.executeQuery(sqlText);
         while (rs.next()) {
-          for (int i = 0; i < _rowDesc.numCol; i++) {
+          for (int i = 0; i < _numCol; i++) {
             Object res = rs.getObject(i + 1);
             if (res == null) ncs[i].addNA();
             else {
@@ -504,8 +459,7 @@ public class SQLManager {
                   ncs[i].addNum(((boolean) res ? 1 : 0), 0);
                   break;
                 case "String":
-                  BufferedString bs = new BufferedString((String) res);
-                  ncs[i].addStr(bs);
+                  ncs[i].addStr(new BufferedString((String) res));
                   break;
                 case "Date":
                   ncs[i].addNum(((Date) res).getTime(), 0);
