@@ -224,7 +224,7 @@ public class SQLManager {
 
         if (autoRebalance) {
           final RebalanceDataSet rds = new RebalanceDataSet(retrieval_fr, destination_key, _v.nChunks());
-          H2O.submitTask(rds).join();
+          H2O.submitTask(rds);
           fr = rds.getResult();
         } else {
           fr = new Frame(destination_key, retrieval_fr.names(), retrieval_fr.vecs());
