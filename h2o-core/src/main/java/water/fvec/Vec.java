@@ -377,10 +377,14 @@ public class Vec extends Keyed<Vec> {
   public static Vec makeCon(long totSize, long len) {
     final int safetyInflationFactor = 8;
     int nchunks = (int) Math.max(totSize * safetyInflationFactor / Value.MAX, 1);
-    return makeCon(len, nchunks);
+    return makeConN(len, nchunks);
   }
 
-  public static Vec makeCon(long len, int nchunks) {
+  /**
+   * Make a new constant vector with fixed number of chunks.
+   * @return New constant vector with the given chunks number.
+   */
+  public static Vec makeConN(long len, int nchunks) {
     long[] espc = new long[nchunks+1];
     espc[0] = 0;
     for( int i=1; i<nchunks; i++ )

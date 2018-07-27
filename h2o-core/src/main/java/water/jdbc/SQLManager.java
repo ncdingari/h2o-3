@@ -199,7 +199,7 @@ public class SQLManager {
     if (optimize) {
       // for optimal retrieval and rebalancing, use min 1 chunk per node, and max chunks = min(max(total threads), max(total connections))
       final int num_retrieval_chunks = H2O.getCloudSize() * ConnectionPoolProvider.getOptimalConnectionPerNode(H2O.getCloudSize(), H2O.ARGS.nthreads);
-      _retrieval_v = num_retrieval_chunks > _v.nChunks() ? _v : makeCon(numRow, num_retrieval_chunks);
+      _retrieval_v = num_retrieval_chunks > _v.nChunks() ? _v : Vec.makeConN(numRow, num_retrieval_chunks);
     } else {
       _retrieval_v = _v;
     }
