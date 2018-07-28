@@ -4,15 +4,12 @@ import org.junit.BeforeClass;
 import org.junit.Ignore;
 import org.junit.Test;
 import water.*;
-import water.util.FrameUtils;
 
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 
 import static org.junit.Assert.*;
-
-import static org.junit.Assert.assertTrue;
 
 /**
  * Tests for Frame.java
