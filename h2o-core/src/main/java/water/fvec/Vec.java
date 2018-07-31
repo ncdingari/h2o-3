@@ -394,6 +394,16 @@ public class Vec extends Keyed<Vec> {
     return makeCon(0, vg, ESPC.rowLayout(vg._key, espc), T_NUM);
   }
 
+  /**
+   * @return the number of chunks that would be required when creating a Vec with given length and rows
+   */
+  public static int nChunksFor(long len, int log_rows_per_chunk, boolean redistribute) {
+    int chunks0 = (int)Math.max(1,len>>log_rows_per_chunk); // redistribute = false
+    int chunks1 = (int)Math.min( 4 * H2O.NUMCPUS * H2O.CLOUD.size(), len); // redistribute = true
+    int nchunks = (redistribute && chunks0 < chunks1 && len > 10*chunks1) ? chunks1 : chunks0;
+    return nchunks;
+  }
+
   /** Make a new constant vector with the given row count.
    *  @return New constant vector with the given row count. */
   public static Vec makeCon(double x, long len, int log_rows_per_chunk, boolean redistribute) {
@@ -401,9 +411,7 @@ public class Vec extends Keyed<Vec> {
   }
 
   public static Vec makeCon(double x, long len, int log_rows_per_chunk, boolean redistribute, byte type) {
-    int chunks0 = (int)Math.max(1,len>>log_rows_per_chunk); // redistribute = false
-    int chunks1 = (int)Math.min( 4 * H2O.NUMCPUS * H2O.CLOUD.size(), len); // redistribute = true
-    int nchunks = (redistribute && chunks0 < chunks1 && len > 10*chunks1) ? chunks1 : chunks0;
+    final int nchunks = nChunksFor(len, log_rows_per_chunk, redistribute);
     long[] espc = new long[nchunks+1];
     espc[0] = 0;
     for( int i=1; i<nchunks; i++ )

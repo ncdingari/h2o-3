@@ -6,8 +6,6 @@ import water.parser.BufferedString;
 import water.parser.ParseDataset;
 import water.util.Log;
 
-import jsr166y.CountedCompleter;
-
 import java.math.BigDecimal;
 import java.sql.*;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -190,23 +188,24 @@ public class SQLManager {
                     +(float)bincols          *numRow*1*binary_ones_fraction //sparse uses a fraction of one byte (or even less)
                     +(float)(realcols+timecols+stringcols) *numRow*8); //8 bytes for real and time (long) values
 
-    final Vec _retrieval_v;
+    final Vec vec;
     final int chunk_size = FileVec.calcOptimalChunkSize(totSize, numCol, numCol * 4,
             H2O.ARGS.nthreads, H2O.getCloudSize(), false, false);
     final double rows_per_chunk = chunk_size; //why not numRow * chunk_size / totSize; it's supposed to be rows per chunk, not the byte size
-    final Vec _v = makeCon(0, numRow, (int) Math.ceil(Math.log1p(rows_per_chunk)), false);
+    final int num_chunks = Vec.nChunksFor(numRow, (int) Math.ceil(Math.log1p(rows_per_chunk)), false);
 
     if (optimize) {
-      // for optimal retrieval and rebalancing, use min 1 chunk per node, and max chunks = min(max(total threads), max(total connections))
-      final int num_retrieval_chunks = H2O.getCloudSize() * ConnectionPoolProvider.getOptimalConnectionPerNode(H2O.getCloudSize(), H2O.ARGS.nthreads);
-      _retrieval_v = num_retrieval_chunks >= _v.nChunks() ? _v : Vec.makeConN(numRow, num_retrieval_chunks);
+      final int num_retrieval_chunks = ConnectionPoolProvider.estimateConcurrentConnections(H2O.getCloudSize(), H2O.ARGS.nthreads);
+      vec = num_retrieval_chunks >= num_chunks
+              ? Vec.makeCon(numRow, num_chunks)
+              : Vec.makeConN(numRow, num_retrieval_chunks);
     } else {
-      _retrieval_v = _v;
+      vec = Vec.makeCon(numRow, num_chunks);
     }
-    //if autoRebalance set to true, we first use optimal #chunks for retrieval and then immediately rebalance to optimal #chunks for later processing
-    final boolean autoRebalance = _v != _retrieval_v && Boolean.parseBoolean(System.getProperty(AUTO_REBALANCE_ENABLED, "false"));
-    Log.info("Number of chunks for data retrieval: " + _retrieval_v.nChunks());
-    Log.info("Number of final chunks: " + (autoRebalance ? _v.nChunks() : _retrieval_v.nChunks()));
+    //if autoRebalance set to true, we first use optimal #chunks for retrieval and then immediately rebalance to optimal #chunks for later data processing
+    final boolean autoRebalance = vec.nChunks() != num_chunks && Boolean.parseBoolean(System.getProperty(AUTO_REBALANCE_ENABLED, "false"));
+    Log.info("Number of chunks for data retrieval: " + vec.nChunks());
+    Log.info("Number of final chunks: " + (autoRebalance ? vec.nChunks() : vec.nChunks()));
     //create frame
     final Key destination_key = Key.make((table + "_sql_to_hex").replaceAll("\\W", "_"));
     final Job<Frame> j = new Job(destination_key, Frame.class.getName(), "Import SQL Table");
@@ -215,23 +214,21 @@ public class SQLManager {
     H2O.H2OCountedCompleter work = new H2O.H2OCountedCompleter() {
       @Override
       public void compute2() {
-        final ConnectionPoolProvider provider = new ConnectionPoolProvider(connection_url, username, password, _retrieval_v.nChunks());
-        final Frame fr;
-        final Key tmpKey = Key.make();
+        final ConnectionPoolProvider provider = new ConnectionPoolProvider(connection_url, username, password, vec.nChunks());
         final Frame retrieval_fr = new SqlTableToH2OFrame(finalTable, needFetchClause, columns, numCol, j, provider)
-                .doAll(columnH2OTypes, _retrieval_v)
-                .outputFrame(tmpKey, columnNames, null);
+                .doAll(columnH2OTypes, vec)
+                .outputFrame(destination_key, columnNames, null);
+
+        Frame fr = retrieval_fr;
 
         if (autoRebalance) {
-          final RebalanceDataSet rds = new RebalanceDataSet(retrieval_fr, destination_key, _v.nChunks());
+          final RebalanceDataSet rds = new RebalanceDataSet(retrieval_fr, destination_key, num_chunks);
           H2O.submitTask(rds);
           fr = rds.getResult();
-        } else {
-          fr = new Frame(destination_key, retrieval_fr.names(), retrieval_fr.vecs());
+          retrieval_fr.remove();
         }
-        Frame.deleteTempFrameAndItsNonSharedVecs(retrieval_fr, fr);
-        _retrieval_v.remove();
-        _v.remove();
+
+        vec.remove();
 
         DKV.put(fr);
         ParseDataset.logParseResults(fr);
@@ -240,17 +237,17 @@ public class SQLManager {
         tryComplete();
       }
     };
-    j.start(work, _retrieval_v.nChunks());
+    j.start(work, vec.nChunks());
     
     return j;
   }
 
   static class ConnectionPoolProvider extends Iced<ConnectionPoolProvider> {
 
-    private String _url;
-    private String _user;
-    private String _password;
-    private int _nChunks;
+    private String url;
+    private String user;
+    private String password;
+    private int nChunks;
 
     /**
      * Instantiates ConnectionPoolProvider
@@ -260,10 +257,10 @@ public class SQLManager {
      * @param nChunks   Number of chunks
      */
     ConnectionPoolProvider(String url, String user, String password, int nChunks) {
-      _url = url;
-      _user = user;
-      _password = password;
-      _nChunks = nChunks;
+      this.url = url;
+      this.user = user;
+      this.password = password;
+      this.nChunks = nChunks;
     }
 
     public ConnectionPoolProvider() {} // Externalizable classes need no-args constructor
@@ -289,24 +286,24 @@ public class SQLManager {
     ArrayBlockingQueue<Connection> createConnectionPool(final int cloudSize, final short nThreads)
         throws RuntimeException {
 
-      final int maxConnectionsPerNode = getMaxConnectionsPerNode(cloudSize, nThreads, _nChunks);
+      final int maxConnectionsPerNode = getMaxConnectionsPerNode(cloudSize, nThreads, nChunks);
       Log.info("Database connections per node: " + maxConnectionsPerNode);
       final ArrayBlockingQueue<Connection> connectionPool = new ArrayBlockingQueue<Connection>(maxConnectionsPerNode);
 
       try {
         for (int i = 0; i < maxConnectionsPerNode; i++) {
-          Connection conn = DriverManager.getConnection(_url, _user, _password);
+          Connection conn = DriverManager.getConnection(url, user, password);
           connectionPool.add(conn);
         }
       } catch (SQLException ex) {
-        throw new RuntimeException("SQLException: " + ex.getMessage() + "\nFailed to connect to SQL database with url: " + _url);
+        throw new RuntimeException("SQLException: " + ex.getMessage() + "\nFailed to connect to SQL database with url: " + url);
       }
 
       return connectionPool;
 
     }
 
-    static int getMaxConnectionsTotal() {
+    private static int getMaxConnectionsTotal() {
       int maxConnections = MAX_CONNECTIONS;
       final String userDefinedMaxConnections = System.getProperty(MAX_USR_CONNECTIONS_KEY);
       try {
@@ -316,7 +313,7 @@ public class SQLManager {
         }
       } catch (NumberFormatException e) {
         Log.info("Unable to parse maximal number of connections: " + userDefinedMaxConnections
-                + ". Falling back to default settings.");
+                + ". Falling back to default settings (" + MAX_CONNECTIONS + ").");
       }
       return maxConnections;
     }
@@ -334,7 +331,7 @@ public class SQLManager {
      * @param maxTotalConnections Maximal number of total connections to be opened by the whole cluster
      * @return Number of connections to open per node, within given minmal and maximal range
      */
-    private static final int calculateLocalConnectionCount(final int maxTotalConnections, final int cloudSize,
+    private static int calculateLocalConnectionCount(final int maxTotalConnections, final int cloudSize,
                                                            final short nThreads, final int nChunks) {
       int conPerNode = (int) Math.min(Math.ceil((double) nChunks / cloudSize), nThreads);
       conPerNode = Math.min(conPerNode, maxTotalConnections / cloudSize);
@@ -342,8 +339,15 @@ public class SQLManager {
       return Math.max(conPerNode, MIN_CONNECTIONS_PER_NODE);
     }
 
-    static int getOptimalConnectionPerNode(final int cloudSize, final short nThreads) {
-      return Math.min(nThreads, Math.max(getMaxConnectionsTotal() / cloudSize, MIN_CONNECTIONS_PER_NODE));
+    /**
+     * for data retrieval and rebalancing, use
+     *   minimum 1 connection per node,
+     *   maximum = min(max(total threads), max(total allowed connections))
+     * t
+     * @return an estimation of the optimal amount of total concurrent connections available to retrieve data
+     */
+    private static int estimateConcurrentConnections(final int cloudSize, final short nThreads) {
+      return cloudSize * Math.min(nThreads, Math.max(getMaxConnectionsTotal() / cloudSize, MIN_CONNECTIONS_PER_NODE));
     }
   }
 
@@ -386,39 +390,39 @@ public class SQLManager {
   }
 
   static class SqlTableToH2OFrame extends MRTask<SqlTableToH2OFrame> {
-    final String _table, _columns;
-    final int _numCol;
-    final boolean _needFetchClause;
-    final Job _job;
-    final ConnectionPoolProvider _poolProvider;
+    final String table, columns;
+    final int numCol;
+    final boolean needFetchClause;
+    final Job job;
+    final ConnectionPoolProvider poolProvider;
 
     transient ArrayBlockingQueue<Connection> sqlConn;
 
     public SqlTableToH2OFrame(final String table, final boolean needFetchClause, final String columns, final int numCol,
                               final Job job, final ConnectionPoolProvider poolProvider) {
-      _table = table;
-      _needFetchClause = needFetchClause;
-      _columns = columns;
-      _numCol = numCol;
-      _job = job;
-      _poolProvider = poolProvider;
+      this.table = table;
+      this.needFetchClause = needFetchClause;
+      this.columns = columns;
+      this.numCol = numCol;
+      this.job = job;
+      this.poolProvider = poolProvider;
     }
 
     @Override
     protected void setupLocal() {
-      sqlConn = _poolProvider.createConnectionPool();
+      sqlConn = poolProvider.createConnectionPool();
     }
 
     @Override
     public void map(Chunk[] cs, NewChunk[] ncs) {
-      if (isCancelled() || _job != null && _job.stop_requested()) return;
+      if (isCancelled() || job != null && job.stop_requested()) return;
       //fetch data from sql table with limit and offset
       Connection conn = null;
       Statement stmt = null;
       ResultSet rs = null;
       Chunk c0 = cs[0];
-      String sqlText = "SELECT " + _columns + " FROM " + _table;
-      if (_needFetchClause)
+      String sqlText = "SELECT " + columns + " FROM " + table;
+      if (needFetchClause)
         sqlText += " OFFSET " + c0.start() + " ROWS FETCH NEXT " + c0._len + " ROWS ONLY";
       else
         sqlText += " LIMIT " + c0._len + " OFFSET " + c0.start();
@@ -429,7 +433,7 @@ public class SQLManager {
         stmt.setFetchSize(c0._len);
         rs = stmt.executeQuery(sqlText);
         while (rs.next()) {
-          for (int i = 0; i < _numCol; i++) {
+          for (int i = 0; i < numCol; i++) {
             Object res = rs.getObject(i + 1);
             if (res == null) ncs[i].addNA();
             else {
@@ -505,7 +509,7 @@ public class SQLManager {
         sqlConn.add(conn);
 
       }
-      if (_job != null) _job.update(1);
+      if (job != null) job.update(1);
     }
 
     @Override
