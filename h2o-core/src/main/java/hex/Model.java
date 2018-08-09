@@ -2274,6 +2274,7 @@ public abstract class Model<M extends Model<M,P,O>, P extends Model.Parameters, 
         }
       }
       Log.info(c+" models were removed");
+      _output._cross_validation_models = null;
     }
   }
 
@@ -2290,9 +2291,12 @@ public abstract class Model<M extends Model<M,P,O>, P extends Model.Parameters, 
       }
       Log.info(c+" predictions were removed");
     }
+    _output._cross_validation_predictions = null;
+
     if (_output._cross_validation_holdout_predictions_frame_id != null) {
       _output._cross_validation_holdout_predictions_frame_id.remove();
     }
+    _output._cross_validation_holdout_predictions_frame_id = null;
   }
 
   @Override public String toString() {
