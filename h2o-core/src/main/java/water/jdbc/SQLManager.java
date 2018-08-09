@@ -30,7 +30,7 @@ public class SQLManager {
   private static final String HIVE_JDBC_DRIVER_CLASS = "org.apache.hive.jdbc.HiveDriver";
 
   private static final String AUTO_REBALANCE_ENABLED = H2O.OptArgs.SYSTEM_PROP_PREFIX + "sql.rebalance.enabled";
-  private static final String TMP_TABLE_ENABLED = H2O.OptArgs.SYSTEM_PROP_PREFIX + "sql.tmp.table.enabled";
+  private static final String TMP_TABLE_ENABLED = H2O.OptArgs.SYSTEM_PROP_PREFIX + "sql.tmp._table.enabled";
 
   /**
    * @param connection_url (Input) 
@@ -53,7 +53,7 @@ public class SQLManager {
     MySQL, PostgreSQL, MariaDB: LIMIT y OFFSET x 
     ? Teradata (and possibly older Oracle): 
      SELECT * FROM (
-        SELECT ROW_NUMBER() OVER () AS RowNum_, <table>.* FROM <table>
+        SELECT ROW_NUMBER() OVER () AS RowNum_, <_table>.* FROM <_table>
      ) QUALIFY RowNum_ BETWEEN x and x+y;
      */
     String databaseType = connection_url.split(":", 3)[1];
@@ -69,13 +69,13 @@ public class SQLManager {
       stmt = conn.createStatement();
       //set fetch size for improved performance
       stmt.setFetchSize(1);
-      //if select_query has been specified instead of table
+      //if select_query has been specified instead of _table
       if (table.equals("")) {
         if (!select_query.toLowerCase().startsWith("select")) {
           throw new IllegalArgumentException("The select_query must start with `SELECT`, but instead is: " + select_query);
         }
 
-        //if tmp table disabled, we use sub-select instead, which outperforms tmp table for very large queries/tables
+        //if tmp _table disabled, we use sub-select instead, which outperforms tmp _table for very large queries/tables
         // the main drawback of sub-selects is that we lose isolation, but as we're only reading data
         // and counting the rows from the beginning, it should not an issue (at least when using hive...)
         final boolean createTmpTable = Boolean.parseBoolean(System.getProperty(TMP_TABLE_ENABLED, "true")); //default to true to keep old behaviour
@@ -88,7 +88,7 @@ public class SQLManager {
         }
       } else if (table.equals(SQLManager.TEMP_TABLE_NAME)) {
         //tables with this name are assumed to be created here temporarily and are dropped
-        throw new IllegalArgumentException("The specified table cannot be named: " + SQLManager.TEMP_TABLE_NAME);
+        throw new IllegalArgumentException("The specified _table cannot be named: " + SQLManager.TEMP_TABLE_NAME);
       }
       //get number of rows. check for negative row count
       if (numRow <= 0) {
@@ -244,23 +244,23 @@ public class SQLManager {
 
   static class ConnectionPoolProvider extends Iced<ConnectionPoolProvider> {
 
-    private String url;
-    private String user;
-    private String password;
-    private int nChunks;
+    private String _url;
+    private String _user;
+    private String _password;
+    private int _nChunks;
 
     /**
      * Instantiates ConnectionPoolProvider
      * @param url       Database URL (JDBC format)
      * @param user      Database username
-     * @param password  Username's password
+     * @param password  Username's _password
      * @param nChunks   Number of chunks
      */
     ConnectionPoolProvider(String url, String user, String password, int nChunks) {
-      this.url = url;
-      this.user = user;
-      this.password = password;
-      this.nChunks = nChunks;
+      _url = url;
+      _user = user;
+      _password = password;
+      _nChunks = nChunks;
     }
 
     public ConnectionPoolProvider() {} // Externalizable classes need no-args constructor
@@ -286,17 +286,17 @@ public class SQLManager {
     ArrayBlockingQueue<Connection> createConnectionPool(final int cloudSize, final short nThreads)
         throws RuntimeException {
 
-      final int maxConnectionsPerNode = getMaxConnectionsPerNode(cloudSize, nThreads, nChunks);
+      final int maxConnectionsPerNode = getMaxConnectionsPerNode(cloudSize, nThreads, _nChunks);
       Log.info("Database connections per node: " + maxConnectionsPerNode);
       final ArrayBlockingQueue<Connection> connectionPool = new ArrayBlockingQueue<Connection>(maxConnectionsPerNode);
 
       try {
         for (int i = 0; i < maxConnectionsPerNode; i++) {
-          Connection conn = DriverManager.getConnection(url, user, password);
+          Connection conn = DriverManager.getConnection(_url, _user, _password);
           connectionPool.add(conn);
         }
       } catch (SQLException ex) {
-        throw new RuntimeException("SQLException: " + ex.getMessage() + "\nFailed to connect to SQL database with url: " + url);
+        throw new RuntimeException("SQLException: " + ex.getMessage() + "\nFailed to connect to SQL database with _url: " + _url);
       }
 
       return connectionPool;
@@ -390,39 +390,39 @@ public class SQLManager {
   }
 
   static class SqlTableToH2OFrame extends MRTask<SqlTableToH2OFrame> {
-    final String table, columns;
-    final int numCol;
-    final boolean needFetchClause;
-    final Job job;
-    final ConnectionPoolProvider poolProvider;
+    final String _table, _columns;
+    final int _numCol;
+    final boolean _needFetchClause;
+    final Job _job;
+    final ConnectionPoolProvider _poolProvider;
 
     transient ArrayBlockingQueue<Connection> sqlConn;
 
     public SqlTableToH2OFrame(final String table, final boolean needFetchClause, final String columns, final int numCol,
                               final Job job, final ConnectionPoolProvider poolProvider) {
-      this.table = table;
-      this.needFetchClause = needFetchClause;
-      this.columns = columns;
-      this.numCol = numCol;
-      this.job = job;
-      this.poolProvider = poolProvider;
+      _table = table;
+      _needFetchClause = needFetchClause;
+      _columns = columns;
+      _numCol = numCol;
+      _job = job;
+      _poolProvider = poolProvider;
     }
 
     @Override
     protected void setupLocal() {
-      sqlConn = poolProvider.createConnectionPool();
+      sqlConn = _poolProvider.createConnectionPool();
     }
 
     @Override
     public void map(Chunk[] cs, NewChunk[] ncs) {
-      if (isCancelled() || job != null && job.stop_requested()) return;
-      //fetch data from sql table with limit and offset
+      if (isCancelled() || _job != null && _job.stop_requested()) return;
+      //fetch data from sql _table with limit and offset
       Connection conn = null;
       Statement stmt = null;
       ResultSet rs = null;
       Chunk c0 = cs[0];
-      String sqlText = "SELECT " + columns + " FROM " + table;
-      if (needFetchClause)
+      String sqlText = "SELECT " + _columns + " FROM " + _table;
+      if (_needFetchClause)
         sqlText += " OFFSET " + c0.start() + " ROWS FETCH NEXT " + c0._len + " ROWS ONLY";
       else
         sqlText += " LIMIT " + c0._len + " OFFSET " + c0.start();
@@ -433,7 +433,7 @@ public class SQLManager {
         stmt.setFetchSize(c0._len);
         rs = stmt.executeQuery(sqlText);
         while (rs.next()) {
-          for (int i = 0; i < numCol; i++) {
+          for (int i = 0; i < _numCol; i++) {
             Object res = rs.getObject(i + 1);
             if (res == null) ncs[i].addNA();
             else {
@@ -509,7 +509,7 @@ public class SQLManager {
         sqlConn.add(conn);
 
       }
-      if (job != null) job.update(1);
+      if (_job != null) _job.update(1);
     }
 
     @Override
