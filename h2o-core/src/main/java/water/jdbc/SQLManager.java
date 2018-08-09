@@ -53,7 +53,7 @@ public class SQLManager {
     MySQL, PostgreSQL, MariaDB: LIMIT y OFFSET x 
     ? Teradata (and possibly older Oracle): 
      SELECT * FROM (
-        SELECT ROW_NUMBER() OVER () AS RowNum_, <_table>.* FROM <_table>
+        SELECT ROW_NUMBER() OVER () AS RowNum_, <table>.* FROM <table>
      ) QUALIFY RowNum_ BETWEEN x and x+y;
      */
     String databaseType = connection_url.split(":", 3)[1];
@@ -69,13 +69,13 @@ public class SQLManager {
       stmt = conn.createStatement();
       //set fetch size for improved performance
       stmt.setFetchSize(1);
-      //if select_query has been specified instead of _table
+      //if select_query has been specified instead of table
       if (table.equals("")) {
         if (!select_query.toLowerCase().startsWith("select")) {
           throw new IllegalArgumentException("The select_query must start with `SELECT`, but instead is: " + select_query);
         }
 
-        //if tmp _table disabled, we use sub-select instead, which outperforms tmp _table for very large queries/tables
+        //if tmp table disabled, we use sub-select instead, which outperforms tmp table for very large queries/tables
         // the main drawback of sub-selects is that we lose isolation, but as we're only reading data
         // and counting the rows from the beginning, it should not an issue (at least when using hive...)
         final boolean createTmpTable = Boolean.parseBoolean(System.getProperty(TMP_TABLE_ENABLED, "true")); //default to true to keep old behaviour
@@ -88,7 +88,7 @@ public class SQLManager {
         }
       } else if (table.equals(SQLManager.TEMP_TABLE_NAME)) {
         //tables with this name are assumed to be created here temporarily and are dropped
-        throw new IllegalArgumentException("The specified _table cannot be named: " + SQLManager.TEMP_TABLE_NAME);
+        throw new IllegalArgumentException("The specified table cannot be named: " + SQLManager.TEMP_TABLE_NAME);
       }
       //get number of rows. check for negative row count
       if (numRow <= 0) {
@@ -253,7 +253,7 @@ public class SQLManager {
      * Instantiates ConnectionPoolProvider
      * @param url       Database URL (JDBC format)
      * @param user      Database username
-     * @param password  Username's _password
+     * @param password  Username's password
      * @param nChunks   Number of chunks
      */
     ConnectionPoolProvider(String url, String user, String password, int nChunks) {
@@ -296,7 +296,7 @@ public class SQLManager {
           connectionPool.add(conn);
         }
       } catch (SQLException ex) {
-        throw new RuntimeException("SQLException: " + ex.getMessage() + "\nFailed to connect to SQL database with _url: " + _url);
+        throw new RuntimeException("SQLException: " + ex.getMessage() + "\nFailed to connect to SQL database with url: " + _url);
       }
 
       return connectionPool;
@@ -416,7 +416,7 @@ public class SQLManager {
     @Override
     public void map(Chunk[] cs, NewChunk[] ncs) {
       if (isCancelled() || _job != null && _job.stop_requested()) return;
-      //fetch data from sql _table with limit and offset
+      //fetch data from sql table with limit and offset
       Connection conn = null;
       Statement stmt = null;
       ResultSet rs = null;
