@@ -30,7 +30,7 @@ public class SQLManager {
   private static final String HIVE_JDBC_DRIVER_CLASS = "org.apache.hive.jdbc.HiveDriver";
 
   private static final String AUTO_REBALANCE_ENABLED = H2O.OptArgs.SYSTEM_PROP_PREFIX + "sql.rebalance.enabled";
-  private static final String TMP_TABLE_ENABLED = H2O.OptArgs.SYSTEM_PROP_PREFIX + "sql.tmp._table.enabled";
+  private static final String TMP_TABLE_ENABLED = H2O.OptArgs.SYSTEM_PROP_PREFIX + "sql.tmp_table.enabled";
 
   /**
    * @param connection_url (Input) 
@@ -197,15 +197,15 @@ public class SQLManager {
     if (optimize) {
       final int num_retrieval_chunks = ConnectionPoolProvider.estimateConcurrentConnections(H2O.getCloudSize(), H2O.ARGS.nthreads);
       vec = num_retrieval_chunks >= num_chunks
-              ? Vec.makeCon(numRow, num_chunks)
+              ? Vec.makeConN(numRow, num_chunks)
               : Vec.makeConN(numRow, num_retrieval_chunks);
     } else {
-      vec = Vec.makeCon(numRow, num_chunks);
+      vec = Vec.makeConN(numRow, num_chunks);
     }
     //if autoRebalance set to true, we first use optimal #chunks for retrieval and then immediately rebalance to optimal #chunks for later data processing
     final boolean autoRebalance = vec.nChunks() != num_chunks && Boolean.parseBoolean(System.getProperty(AUTO_REBALANCE_ENABLED, "false"));
     Log.info("Number of chunks for data retrieval: " + vec.nChunks());
-    Log.info("Number of final chunks: " + (autoRebalance ? vec.nChunks() : vec.nChunks()));
+    Log.info("Number of final chunks: " + num_chunks);
     //create frame
     final Key destination_key = Key.make((table + "_sql_to_hex").replaceAll("\\W", "_"));
     final Job<Frame> j = new Job(destination_key, Frame.class.getName(), "Import SQL Table");
