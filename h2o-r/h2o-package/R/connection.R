@@ -190,8 +190,6 @@ h2o.init <- function(ip = "localhost", port = 54321, startH2O = TRUE, forceDL = 
         print(rv$httpStatusCode)
         print(rv$curlErrorMessage)
 
-        #try a hail mary curl
-        print(system("curl 'http://localhost:54321'"))
         stop("H2O failed to start, stopping execution.")
       }
     } else
@@ -533,6 +531,12 @@ h2o.clusterStatus <- function() {
         "http://www.oracle.com/technetwork/java/javase/downloads/jdk8-downloads-2133151.html")
       }
     )
+
+  # NOTE for developers: keep the following blacklist in logically consistent with whitelist in java code - see water.H2O.checkUnsupportedJava, near line 1849
+  if (grepl("^java version \"1\\.[1-6]\\.", jver[1])) {
+    stop("Your java is not supported: ", jver[1], "\n",
+    "Check documentation at http://docs.h2o.ai/h2o/latest-stable/h2o-docs/welcome.html#requirements")
+  }
 
   if(any(grepl("GNU libgcj", jver))) {
     stop("Sorry, GNU Java is not supported for H2O.\n",
